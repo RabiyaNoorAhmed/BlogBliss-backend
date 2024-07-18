@@ -3,6 +3,9 @@ const admin = require('firebase-admin');
 const path = require('path');
 const { connect } = require('mongoose');
 const upload = require('express-fileupload');
+const userRoutes = require('./routes/userRoutes');
+const postRoutes = require('./routes/postRoutes');
+const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -21,10 +24,6 @@ app.use(express.json({ extended: true }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ credentials: true, origin: "http://localhost:5173" }));
 
-// Other middleware and routes setup
-const userRoutes = require('./routes/userRoutes');
-const postRoutes = require('./routes/postRoutes');
-const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 
 app.use('/api/users', userRoutes);
 app.use('/api/posts', postRoutes);

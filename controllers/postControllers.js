@@ -4,6 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuid } = require("uuid");
 const HttpError = require('../models/errorModel')
+const admin = require('firebase-admin');
+
+const bucket = admin.storage().bucket();
 //CREATE A POST
 //POST: api/posts
 //PROTECTED
@@ -12,35 +15,66 @@ const createPost = async (req, res, next) => {
         let { title, category, description } = req.body;
         if (!title || !category || !description || !req.files) {
             return next(new HttpError("Fill in all fields and Choose Thumbnail.", 422));
-        };
-        const { thumbnail } = req.files;
-        //Check the file Size
-        if (thumbnail.size > 2000000) {
-            return next(new HttpError("Thumbnail too big. File should be less then 2MB"));
-        };
-        let fileName = thumbnail.name;
-        let splittedFilename = fileName.split(".")
-        let newFilename = splittedFilename[0] + uuid() + "." + splittedFilename[splittedFilename.length - 1]
-        thumbnail.mv(path.join(__dirname, '..', '/uploads', newFilename), async (err) => {
-            if (err) {
-                return next(new HttpError(err));
-            } else {
-                const newPost = await Post.create({ title, category, description, thumbnail: newFilename, creator: req.user.id })
-                if (!newPost) {
-                    return next(new HttpError("Post couldn't be Created.", 422));
-                };
-                //Find User and Increase post count by 1
-                const currentUser = await User.findById(req.user.id);
-                const userPostCount = currentUser.posts + 1;
-                await User.findByIdAndUpdate(req.user.id, { posts: userPostCount })
+        }
 
-                res.status(201).json(newPost)
+        const { thumbnail } = req.files;
+        if (thumbnail.size > 2000000) {
+            return next(new HttpError("Thumbnail too big. File should be less than 2MB"));
+        }
+
+        let fileName = thumbnail.name;
+        let splittedFilename = fileName.split(".");
+        let newFilename = splittedFilename[0] + uuid() + "." + splittedFilename[splittedFilename.length - 1];
+
+        const thumbnailStream = require('stream').Readable.from(thumbnail.data);
+
+        const fileUpload = bucket.file(`uploads/thumbnails/${newFilename}`);
+        const stream = fileUpload.createWriteStream({
+            metadata: {
+                contentType: thumbnail.mimetype,
+                metadata: {
+                    firebaseStorageDownloadTokens: uuid()  // Add a token for access control
+                }
+            },
+            resumable: false
+        });
+
+        stream.on('error', (err) => {
+            return next(new HttpError(err));
+        });
+
+        stream.on('finish', async () => {
+            const publicUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/uploads%2Fthumbnails%2F${encodeURIComponent(newFilename)}?alt=media`;
+
+            const newPost = await Post.create({
+                title,
+                category,
+                description,
+                thumbnail: publicUrl,
+                creator: req.user.id
+            });
+
+            if (!newPost) {
+                return next(new HttpError("Post couldn't be Created.", 422));
             }
-        })
+
+            const currentUser = await User.findById(req.user.id);
+            const userPostCount = currentUser.posts + 1;
+            await User.findByIdAndUpdate(req.user.id, { posts: userPostCount });
+
+            res.status(201).json(newPost);
+        });
+
+        thumbnailStream.pipe(stream);
+
     } catch (error) {
         return next(new HttpError(error));
     }
 };
+
+
+
+
 
 
 
@@ -108,52 +142,107 @@ const getUserPosts = async (req, res, next) => {
 //PROTECTED
 const editPost = async (req, res, next) => {
     try {
-        let fileName;
-        let newFilename;
-        let updatedPost;
         const postId = req.params.id;
         let { title, category, description } = req.body;
-        if (!title || !category || description < 12) {
-            return next(new HttpError("Fill in all fields.", 422));
+
+        // Validate input fields
+        if (!title || !category || description.length < 12) {
+            return next(new HttpError("Fill in all fields and ensure description is at least 12 characters long.", 422));
         }
-        if (!req.files) {
-            updatedPost = await Post.findByIdAndUpdate(postId, { title, category, description }, { new: true })
-        } else {
-            //Get old post from Database
-            const oldPost = await Post.findById(postId);
-            if (req.user.id == oldPost.creator) {
-                //Delete old thumbnail from upload
-                fs.unlink(path.join(__dirname, "..", "uploads", oldPost.thumbnail), async (err) => {
-                    if (err) {
-                        return next(new HttpError(err));
-                    }
-                });
-                //Upload New Thumbnail
-                const { thumbnail } = req.files;
-                //Check File Size
-                if (thumbnail.size > 2000000) {
-                    return next(new HttpError("Thumbnail too big.Should be less than 2MB"));
-                }
-                fileName = thumbnail.name;
-                let splittedFilename = fileName.split(".")
-                let newFilename = splittedFilename[0] + uuid() + "." + splittedFilename[splittedFilename.length - 1]
-                thumbnail.mv(path.join(__dirname, '..', 'uploads', newFilename), async (err) => {
-                    if (err) {
-                        return next(new HttpError(err));
-                    }
-                })
-                updatedPost = await Post.findByIdAndUpdate(postId,
-                    { title, category, description, thumbnail: newFilename }, { new: true })
+
+        let updatedPost;
+
+        // Check if there are no new files (only update post details)
+        if (!req.files || !req.files.thumbnail) {
+            updatedPost = await Post.findByIdAndUpdate(postId, { title, category, description }, { new: true });
+            if (!updatedPost) {
+                return next(new HttpError("Couldn't update post.", 400));
             }
+            return res.status(200).json(updatedPost);
         }
-        if (!updatedPost) {
-            return next(new HttpError("Couldn't Update Post.", 400));
+
+        // Handle thumbnail update scenario
+        const oldPost = await Post.findById(postId);
+
+        // Ensure the current user is the creator of the post
+        if (req.user.id !== oldPost.creator.toString()) {
+            return next(new HttpError("You are not authorized to edit this post.", 401));
         }
-        res.status(200).json(updatedPost)
+
+        const { thumbnail } = req.files;
+
+        // Check File Size
+        if (thumbnail.size > 2000000) {
+            return next(new HttpError("Thumbnail too big. Should be less than 2MB.", 422));
+        }
+
+        // Generate a unique filename for the new thumbnail
+        const fileName = thumbnail.name;
+        const ext = path.extname(fileName);
+        const newFilename = `${uuid()}${ext}`;
+
+        // Create a readable stream from thumbnail data
+        const thumbnailStream = require('stream').Readable.from(thumbnail.data);
+
+        // Upload New Thumbnail to Firebase Storage
+        const fileUpload = bucket.file(`uploads/thumbnails/${newFilename}`);
+        const stream = fileUpload.createWriteStream({
+            metadata: {
+                contentType: thumbnail.mimetype,
+                metadata: {
+                    firebaseStorageDownloadTokens: uuid()  // Add a token for access control
+                }
+            },
+            resumable: false
+        });
+
+        // Handle stream events (errors, finish)
+        stream.on('error', (err) => {
+            return next(new HttpError(err));
+        });
+
+        stream.on('finish', async () => {
+            try {
+                // Delete old thumbnail from Firebase Storage if it exists
+                if (oldPost.thumbnail) {
+                    const oldThumbnailPath = `uploads/thumbnails/${path.basename(oldPost.thumbnail)}`;
+                    await bucket.file(oldThumbnailPath).delete();
+                }
+            } catch (err) {
+                console.error('Error deleting old thumbnail:', err);
+                // Handle error if needed
+            }
+
+            // Update post with new details and Firebase Storage URL
+            updatedPost = await Post.findByIdAndUpdate(postId,
+                { title, category, description, thumbnail: fileUpload.name },
+                { new: true }
+            );
+
+            if (!updatedPost) {
+                return next(new HttpError("Couldn't update post.", 400));
+            }
+
+            // Generate public URL for the new thumbnail
+            const publicUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileUpload.name)}?alt=media`;
+
+            // Update post with the public URL
+            updatedPost.thumbnail = publicUrl;
+            await updatedPost.save();
+
+            res.status(200).json(updatedPost);
+        });
+
+        // Pipe the file data to the writable stream
+        thumbnailStream.pipe(stream);
+
     } catch (error) {
         return next(new HttpError(error));
     }
 };
+
+
+
 
 
 //DELETE POST
@@ -163,30 +252,45 @@ const deletePost = async (req, res, next) => {
     try {
         const postId = req.params.id;
         if (!postId) {
-            return next(new HttpError("Post Unavailable", 400));
-        };
-        const post = await Post.findById(postId);
-        const fileName = post?.thumbnail;
-        if (req.user.id == post.creator) {
-            //Delete Thumbnail from uploads Folder
-fs.unlink(path.join(__dirname, '..', 'uploads', fileName), async (err) => {
-                if (err) {
-                    return next(new HttpError(err));
-                } else {
-                    await Post.findByIdAndDelete(postId);
-                    //Find user and Reduce Post count by 1
-                    const currentUser = await User.findById(req.user.id);
-                    const userPostCount = currentUser?.posts - 1;
-                    await User.findByIdAndUpdate(req.user.id, { posts: userPostCount })
-                    res.json(`Post ${postId} Deleted Successfully`)
-                }
-            });
-        } else {
-            return next(new HttpError("Post Couldn't be Deleted", 403));
+            return next(new HttpError("Post ID is required.", 400));
         }
+
+        const post = await Post.findById(postId);
+        if (!post) {
+            return next(new HttpError("Post not found.", 404));
+        }
+
+        // Check if the current user is the creator of the post
+        if (req.user.id !== post.creator.toString()) {
+            return next(new HttpError("Unauthorized. You are not allowed to delete this post.", 403));
+        }
+
+        const fileName = post.thumbnail;
+
+        // Delete the post document from MongoDB
+        await Post.findByIdAndDelete(postId);
+
+        // Delete the post's thumbnail from Firebase Storage if it exists
+        if (fileName) {
+            const fileRef = bucket.file(`uploads/thumbnails/${fileName}`);
+            const [exists] = await fileRef.exists();
+
+            if (exists) {
+                await fileRef.delete();
+            } else {
+                console.warn(`Thumbnail file ${fileName} not found in Firebase Storage.`);
+            }
+        }
+
+        //Find user and Reduce Post count by 1
+        const currentUser = await User.findById(req.user.id);
+        const userPostCount = currentUser?.posts - 1;
+        await User.findByIdAndUpdate(req.user.id, { posts: userPostCount })
+        res.json(`Post ${postId} deleted successfully.`);
     } catch (error) {
         return next(new HttpError(error));
     }
 };
+
 
 module.exports = { createPost, getPosts, getPost, getCatPosts, getUserPosts, editPost, deletePost }

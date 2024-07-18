@@ -5,7 +5,9 @@ const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
 const { v4: uuid } = require("uuid")
+const admin = require('firebase-admin');
 
+const bucket = admin.storage().bucket();
 
 // REGISTER A NEW USER
 //POST : api/users/register
@@ -94,90 +96,124 @@ const getUser = async (req, res, next) => {
 //Protected
 const changeAvatar = async (req, res, next) => {
     try {
-        if (!req.files.avatar) {
-            return next(new HttpError("Please Choose An Image.", 422))
+        if (!req.files || !req.files.avatar) {
+            return next(new HttpError("Please Choose An Image.", 422));
         }
-        //find user from Database
-        const user = await User.findById(req.user.id)
-        //Delete old Avatar if exists
-        if (user.avatar) {
-            fs.unlink(path.join(__dirname, '..', 'uploads', user.avatar), (err) => {
-                if (err) {
-                    return next(new HttpError(err))
-                }
-            })
-        };
 
         const { avatar } = req.files;
-        //Check File Size
-        if (avatar.size > 500000) {
-            return next(new HttpError("Profile Picture too big. Should be less than 500kb"), 422)
-        }
-        let fileName;
-        fileName = avatar.name;
-        let splittedFilename = fileName.split(".");
-        let newFilename = splittedFilename[0] + uuid() + '.' + splittedFilename[splittedFilename.length - 1]
-        avatar.mv(path.join(__dirname, '..', 'uploads', newFilename), async (err) => {
-            if (err) {
-                return next(new HttpError(err))
-            };
 
-            const updatedAvatar = await User.findByIdAndUpdate(req.user.id, { avatar: newFilename }, { new: true })
-            if (!updatedAvatar) {
-                return next(new HttpError("Avatar Couldn't be Changed", 422))
+        // Check File Size
+        if (avatar.size > 500000) {
+            return next(new HttpError("Profile Picture too big. Should be less than 500kb", 422));
+        }
+        // Find user from Database (example: MongoDB)
+        const user = await User.findById(req.user.id);
+        // Delete old Avatar if exists
+        if (user.avatar) {
+            try {
+                const oldAvatarFile = bucket.file(`uploads/avatars/${user.avatar}`);
+                const [exists] = await oldAvatarFile.exists();
+                if (exists) {
+                    await oldAvatarFile.delete();
+                    console.log(`Old avatar ${user.avatar} deleted successfully`);
+                } else {
+                    console.log(`Old avatar ${user.avatar} not found in storage`);
+                }
+            } catch (error) {
+                console.error("Error deleting old avatar:", error);
+                // Handle deletion error gracefully, such as logging or continuing without blocking
             }
-            res.status(200).json(updatedAvatar)
-        })
+        }
+        // Generate new filename for avatar
+        const fileName = `${uuid()}.${avatar.name.split('.').pop()}`;
+        const fileUpload = bucket.file(`uploads/avatars/${fileName}`);
+
+        // Create write stream for file upload
+        const avatarStream = fileUpload.createWriteStream({
+            metadata: {
+                contentType: avatar.mimetype,
+            },
+            resumable: false // Optional: Disables resumable uploads, useful for smaller files
+        });
+
+        // Handle upload errors
+        avatarStream.on('error', (err) => {
+            console.error("Error uploading avatar:", err);
+            return next(new HttpError("Failed to upload avatar", 500));
+        });
+
+        // Handle upload completion
+        avatarStream.on('finish', async () => {
+            // Make uploaded file publicly accessible
+            await fileUpload.makePublic();
+
+            // Get the public URL of the uploaded file
+            const avatarUrl = `https://storage.googleapis.com/${bucket.name}/${fileUpload.name}`;
+
+            // Update user's avatar field in your database (if needed)
+            // Example: MongoDB update
+            await User.findByIdAndUpdate(req.user.id, { avatar: avatarUrl }, { new: true });
+
+            // Return the avatar URL to the client
+            res.status(200).json({ avatarUrl });
+        });
+
+        // Start uploading avatar data
+        avatarStream.end(avatar.data);
 
     } catch (error) {
-        return next(new HttpError(error))
+        console.error("Change avatar error:", error);
+        return next(new HttpError(error.message, 500));
     }
-}
+};
+
+
+
 
 
 // EDIT USER DETAILS (from profile)
 //POST : api/users/edit-user
 //Protected
 const editUser = async (req, res, next) => {
-   try {
-    const {name,email,currentPassword,newPassword,confirmNewPassword}= req.body;
-    if(!name,!email,!currentPassword,!newPassword,!confirmNewPassword){
-        return next(new HttpError('Fill in all Fields', 422))
+    try {
+        const { name, email, currentPassword, newPassword, confirmNewPassword } = req.body;
+        if (!name, !email, !currentPassword, !newPassword, !confirmNewPassword) {
+            return next(new HttpError('Fill in all Fields', 422))
+        }
+        // Get user from database
+        const user = await User.findById(req.user.id);
+        if (!user) {
+            return next(new HttpError("User Not Found.", 403))
+        }
+        //New Email doesn't already exist
+        const emailExit = await User.findOne({ email });
+        /* I want to update other details with/without changing
+         the email (which is a unique id because we use it to login)*/
+        if (emailExit && (emailExit._id != req.user.id)) {
+            return next(new HttpError("Email already Exist.", 422))
+        };
+
+        // Compare Current Password to Database Password
+        const validateUserPassword = await bcrypt.compare(currentPassword, user.password);
+        if (!validateUserPassword) {
+            return next(new HttpError("Invalid Current Password.", 422))
+        }
+
+        //Compare new Passwords
+        if (newPassword !== confirmNewPassword) {
+            return next(new HttpError("New Passwords do not Match.", 422))
+        };
+
+        //Hash New Passwords
+        const salt = await bcrypt.genSalt(10);
+        const hash = await bcrypt.hash(newPassword, salt);
+
+        //Update User Info In Database
+        const newInfo = await User.findByIdAndUpdate(req.user.id, { name, email, password: hash }, { new: true });
+        res.status(200).json(newInfo)
+    } catch (error) {
+        return next(new HttpError(error))
     }
-    // Get user from database
-    const user = await User.findById(req.user.id);
-    if(!user){
-        return next(new HttpError("User Not Found.",403))
-    }
-    //New Email doesn't already exist
-    const emailExit = await User.findOne({email});
-    /* I want to update other details with/without changing
-     the email (which is a unique id because we use it to login)*/
-    if(emailExit && (emailExit._id != req.user.id)){
-        return next(new HttpError("Email already Exist.",422))
-    };
-
-    // Compare Current Password to Database Password
-     const validateUserPassword = await bcrypt.compare(currentPassword,user.password);
-     if(!validateUserPassword){
-        return next(new HttpError("Invalid Current Password.",422))
-     }
-
-     //Compare new Passwords
-     if(newPassword !== confirmNewPassword){
-        return next(new HttpError("New Passwords do not Match.",422))
-     };
-
-     //Hash New Passwords
-     const salt = await bcrypt.genSalt(10);
-     const hash = await bcrypt.hash(newPassword,salt);
-
-     //Update User Info In Database
-     const newInfo = await User.findByIdAndUpdate(req.user.id,{name,email,password:hash},{new:true});
-     res.status(200).json(newInfo)
-   } catch (error) {
-    return next(new HttpError(error))
-   }
 }
 
 // GET AUTHORS

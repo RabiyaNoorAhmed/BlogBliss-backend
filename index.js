@@ -23,7 +23,7 @@ const app = express();
 app.use(upload());
 app.use(express.json({ extended: true }));
 app.use(express.urlencoded({ extended: true }));
-app.use(cors({ credentials: true, origin: "https://frontend-six-phi-22.vercel.app/" }));
+app.use(cors({ credentials: true, origin: "http://localhost:5173" }));
 
 
 

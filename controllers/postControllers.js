@@ -248,6 +248,8 @@ const editPost = async (req, res, next) => {
 //DELETE POST
 //DELETE: api/posts/:id
 //PROTECTED
+
+
 const deletePost = async (req, res, next) => {
     try {
         const postId = req.params.id;
